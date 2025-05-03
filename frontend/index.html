@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weather Tile Server Test Interface</title>
+
+    <!-- Leaflet CSS and JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+        .sidebar {
+            width: 300px;
+            padding: 15px;
+            background-color: #f0f0f0;
+            overflow-y: auto;
+        }
+        .map-container {
+            flex-grow: 1;
+        }
+        #map {
+            height: 100%;
+        }
+        h2 {
+            margin-top: 20px;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+        .layer-controls {
+            margin-bottom: 20px;
+        }
+        .opacity-slider {
+            width: 100%;
+            margin: 10px 0;
+        }
+        .level-selector {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        select {
+            width: 100%;
+            padding: 5px;
+        }
+        .legend {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: white;
+            border-radius: 5px;
+            box-shadow: 0 0 5px rgba(0,0,0,0.2);
+        }
+        .legend-title {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .legend-gradient {
+            height: 20px;
+            width: 100%;
+            margin: 5px 0;
+            background: linear-gradient(to right, #0000FF, #00FF00, #FFFF00, #FF0000);
+        }
+        .legend-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+        }
+        .temp-legend-gradient {
+            background: linear-gradient(to right, #00274D, #005EA8, #00BFFF, #7FFF00, #FFD700, #FF4500);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h1>Weather Visualization</h1>
+
+            <div class="level-selector">
+                <label for="pressure-level">Pressure Level:</label>
+                <select id="pressure-level" onchange="updateLayers()">
+                    <option value="100hPa">100 hPa</option>
+                    <option value="127hPa">127 hPa</option>
+                    <option value="147hPa">147 hPa</option>
+                    <option value="178hPa">178 hPa</option>
+                    <option value="196hPa">196 hPa</option>
+                    <option value="227hPa">227 hPa</option>
+                    <option value="250hPa" selected>250 hPa</option>
+                    <option value="274hPa">274 hPa</option>
+                    <option value="300hPa">300 hPa</option>
+                    <option value="344hPa">344 hPa</option>
+                    <option value="392hPa">392 hPa</option>
+                    <option value="446hPa">446 hPa</option>
+                    <option value="506hPa">506 hPa</option>
+                    <option value="595hPa">595 hPa</option>
+                    <option value="696hPa">696 hPa</option>
+                    <option value="752hPa">752 hPa</option>
+                    <option value="843hPa">843 hPa</option>
+                </select>
+            </div>
+
+            <h2>Layer Controls</h2>
+
+            <div class="layer-controls">
+                <div>
+                    <input type="checkbox" id="wind-layer" onchange="toggleLayer('wind')" checked>
+                    <label for="wind-layer">Wind Layer</label>
+                    <input type="range" id="wind-opacity" class="opacity-slider" min="0" max="1" step="0.1" value="0.7" oninput="updateOpacity('wind')">
+                </div>
+
+                <div>
+                    <input type="checkbox" id="temp-layer" onchange="toggleLayer('temp')">
+                    <label for="temp-layer">Temperature Layer</label>
+                    <input type="range" id="temp-opacity" class="opacity-slider" min="0" max="1" step="0.1" value="0.7" oninput="updateOpacity('temp')">
+                </div>
+
+                <div>
+                    <input type="checkbox" id="streamline-layer" onchange="toggleLayer('streamline')">
+                    <label for="streamline-layer">Streamline Layer</label>
+                    <input type="range" id="streamline-opacity" class="opacity-slider" min="0" max="1" step="0.1" value="0.9" oninput="updateOpacity('streamline')">
+                </div>
+            </div>
+
+            <div class="legend">
+                <div class="legend-title">Wind Speed</div>
+                <div class="legend-gradient"></div>
+                <div class="legend-labels">
+                    <span>0 m/s</span>
+                    <span>50 m/s</span>
+                </div>
+            </div>
+
+            <div class="legend">
+                <div class="legend-title">Temperature</div>
+                <div class="legend-gradient temp-legend-gradient"></div>
+                <div class="legend-labels">
+                    <span>-30°C</span>
+                    <span>40°C</span>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <small>Based on data from: <br>Weather Tile Server</small>
+            </div>
+        </div>
+
+        <div class="map-container">
+            <div id="map"></div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize the map
+        const map = L.map('map').setView([20, 0], 2);
+
+        // Add base layer (OpenStreetMap)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // Define the base URL for tile server
+        const tileServerBaseUrl = '../tiles';
+
+        // Layer objects to manage the different tile layers
+        let windLayer = null;
+        let tempLayer = null;
+        let streamlineLayer = null;
+
+        // Function to create and update layers based on selected flight level
+        function updateLayers() {
+            const selectedLevel = document.getElementById('pressure-level').value;
+
+            // Remove existing layers
+            if (windLayer) map.removeLayer(windLayer);
+            if (tempLayer) map.removeLayer(tempLayer);
+            if (streamlineLayer) map.removeLayer(streamlineLayer);
+
+            // Create new layers with the selected flight level
+            // Wind Layer
+            windLayer = L.tileLayer(`${tileServerBaseUrl}/wind/${selectedLevel}/{z}/{x}/{y}.png`, {
+                maxZoom: 8,
+                opacity: document.getElementById('wind-opacity').value,
+                tms: false
+            });
+
+            // Temperature Layer
+            tempLayer = L.tileLayer(`${tileServerBaseUrl}/temp/${selectedLevel}/{z}/{x}/{y}.png`, {
+                maxZoom: 8,
+                opacity: document.getElementById('temp-opacity').value,
+                tms: false
+            });
+
+            // Streamline Layer
+            streamlineLayer = L.tileLayer(`${tileServerBaseUrl}/streamline/${selectedLevel}/{z}/{x}/{y}.png`, {
+                maxZoom: 8,
+                opacity: document.getElementById('streamline-opacity').value,
+                tms: false
+            });
+
+            // Add selected layers back to the map
+            if (document.getElementById('wind-layer').checked) {
+                windLayer.addTo(map);
+            }
+
+            if (document.getElementById('temp-layer').checked) {
+                tempLayer.addTo(map);
+            }
+
+            if (document.getElementById('streamline-layer').checked) {
+                streamlineLayer.addTo(map);
+            }
+        }
+
+        // Toggle a layer on/off
+        function toggleLayer(layerType) {
+            const isChecked = document.getElementById(`${layerType}-layer`).checked;
+
+            switch(layerType) {
+                case 'wind':
+                    if (isChecked && windLayer) {
+                        map.addLayer(windLayer);
+                    } else if (windLayer) {
+                        map.removeLayer(windLayer);
+                    }
+                    break;
+                case 'temp':
+                    if (isChecked && tempLayer) {
+                        map.addLayer(tempLayer);
+                    } else if (tempLayer) {
+                        map.removeLayer(tempLayer);
+                    }
+                    break;
+                case 'streamline':
+                    if (isChecked && streamlineLayer) {
+                        map.addLayer(streamlineLayer);
+                    } else if (streamlineLayer) {
+                        map.removeLayer(streamlineLayer);
+                    }
+                    break;
+            }
+        }
+
+        // Update layer opacity
+        function updateOpacity(layerType) {
+            const opacity = document.getElementById(`${layerType}-opacity`).value;
+
+            switch(layerType) {
+                case 'wind':
+                    if (windLayer) windLayer.setOpacity(opacity);
+                    break;
+                case 'temp':
+                    if (tempLayer) tempLayer.setOpacity(opacity);
+                    break;
+                case 'streamline':
+                    if (streamlineLayer) streamlineLayer.setOpacity(opacity);
+                    break;
+            }
+        }
+
+        // Initialize layers when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            updateLayers();
+        });
+    </script>
+</body>
+</html>
