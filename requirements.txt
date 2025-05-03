@@ -1,0 +1,14 @@
+xarray
+cfgrib
+pyproj
+mercantile
+shapely
+geojson
+numpy
+matplotlib
+pillow
+psutil
+dask[complete]
+numexpr
+numba
+scipy
