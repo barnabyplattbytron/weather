@@ -9,6 +9,7 @@ import time
 import xarray as xr
 import numpy as np
 import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from config import VECTOR_ZOOM_LEVELS, RASTER_ZOOM_LEVELS
 from data_processing import (
@@ -19,8 +20,19 @@ from data_processing import (
 from tile_generator import generate_raster_tiles
 from utils import ensure_dir_exists
 
-def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_levels, output_dir, num_workers):
-    """Process GRIB files and create vector and raster tiles for each pressure level."""
+def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_levels, output_dir, num_workers, tile_type='all'):
+    """
+    Process GRIB files and create vector and raster tiles for each pressure level.
+
+    Args:
+        wind_file: Path to the wind GRIB file
+        temp_file: Path to the temperature GRIB file (optional)
+        vector_zoom_levels: List of zoom levels for vector tiles
+        raster_zoom_levels: List of zoom levels for raster tiles
+        output_dir: Directory to save output tiles
+        num_workers: Number of workers for parallel processing
+        tile_type: Type of tiles to generate ('wind', 'temp', 'streamline', or 'all')
+    """
     # Read wind data
     print(f"\nProcessing wind file: {wind_file}")
     try:
@@ -94,21 +106,45 @@ def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_lev
 
             # Process the data for this level
             process_single_level(wind_ds, u_data, v_data, temp_data, lats, lons,
-                               flight_level, vector_zoom_levels, raster_zoom_levels, output_dir, num_workers)
+                               flight_level, vector_zoom_levels, raster_zoom_levels, output_dir, num_workers, tile_type)
 
         else:
             # Process each level separately in parallel
             print(f"Found {len(level_values)} levels: {level_values}")
 
+            # Cache temperature data if available to avoid re-reading for each level
+            temp_ds = None
+            if temp_file and os.path.exists(temp_file):
+                temp_ds = read_grib_file(temp_file)
+                if temp_ds is None:
+                    print(f"Warning: Unable to read temperature file: {temp_file}")
+
             # Prepare tasks for parallel processing
             tasks = []
             for level_val in level_values:
-                # Skip processing this level if it's already been processed
                 flight_level = f"{int(level_val)}hPa"
-                if os.path.exists(os.path.join(output_dir, "wind", flight_level)) and \
+
+                # Only skip if we're generating ALL tiles AND both wind and temp directories exist
+                # If we're generating a specific tile type, always process the level
+                if tile_type == 'all' and \
+                   os.path.exists(os.path.join(output_dir, "wind", flight_level)) and \
                    os.path.exists(os.path.join(output_dir, "temp", flight_level)):
                     print(f"Skipping already processed level: {flight_level}")
                     continue
+
+                # If generating a specific tile type, check if that type exists
+                if tile_type == 'wind' and os.path.exists(os.path.join(output_dir, "wind", flight_level)):
+                    print(f"Skipping level {flight_level} - wind tiles already exist")
+                    continue
+
+                if tile_type == 'temp' and os.path.exists(os.path.join(output_dir, "temp", flight_level)):
+                    print(f"Skipping level {flight_level} - temperature tiles already exist")
+                    continue
+
+                if tile_type == 'streamline' and os.path.exists(os.path.join(output_dir, "streamline", flight_level)):
+                    # Even if the directory exists, we're going to force regeneration for streamline tiles
+                    # by not skipping it here
+                    pass
 
                 # Select data for this level
                 level_wind_ds = wind_ds.sel({level_dim: level_val})
@@ -143,31 +179,32 @@ def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_lev
                 temp_data = None
 
                 # Read temperature data if available
-                if temp_file and os.path.exists(temp_file):
-                    temp_ds = read_grib_file(temp_file)
-                    if temp_ds is not None:
-                        try:
-                            # Try to select the same level from temperature data
-                            if level_dim in temp_ds.dims or level_dim in temp_ds.coords:
-                                level_temp_ds = temp_ds.sel({level_dim: level_val})
-                                temp_data = get_temperature(level_temp_ds)
-                            else:
-                                temp_data = get_temperature(temp_ds)
-                        except ValueError as e:
-                            print(f"Error extracting temperature for level {flight_level}: {e}")
+                if temp_ds is not None:
+                    try:
+                        # Try to select the same level from temperature data
+                        if level_dim in temp_ds.dims or level_dim in temp_ds.coords:
+                            level_temp_ds = temp_ds.sel({level_dim: level_val})
+                            temp_data = get_temperature(level_temp_ds)
+                        else:
+                            temp_data = get_temperature(temp_ds)
+                    except ValueError as e:
+                        print(f"Error extracting temperature for level {flight_level}: {e}")
 
                 # Add this level's processing task to the queue
                 tasks.append((level_wind_ds, u_data, v_data, temp_data, lats, lons,
-                             flight_level, vector_zoom_levels, raster_zoom_levels, output_dir))
+                             flight_level, vector_zoom_levels, raster_zoom_levels, output_dir, num_workers, tile_type))
 
-            # Process levels in parallel with a thread pool
+            # Process levels in parallel
             if tasks:
-                print(f"Processing {len(tasks)} flight levels in parallel with {min(len(tasks), num_workers)} threads")
+                print(f"Processing {len(tasks)} flight levels in parallel with {min(len(tasks), num_workers)} processes")
                 start_time = time.time()
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), num_workers)) as executor:
+                # Use ProcessPoolExecutor for CPU-bound tasks to bypass the GIL
+                # and get true parallel processing on multiple cores
+                with ProcessPoolExecutor(max_workers=min(len(tasks), num_workers)) as executor:
                     # Submit all tasks to the executor
-                    futures = {executor.submit(process_single_level, *task, num_workers): task[6] for task in tasks}
+                    # We're now using pickle to serialize the data between processes
+                    futures = {executor.submit(process_single_level, *task): task[6] for task in tasks}
 
                     # Process results as they complete
                     for future in concurrent.futures.as_completed(futures):
@@ -177,9 +214,11 @@ def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_lev
                             print(f"✓ Completed processing for flight level {flight_level}")
                         except Exception as e:
                             print(f"✗ Error processing flight level {flight_level}: {e}")
+                            import traceback
+                            traceback.print_exc()
 
                 elapsed_time = time.time() - start_time
-                print(f"Processed {len(tasks)} flight levels in {elapsed_time:.1f} seconds")
+                print(f"Processed {len(tasks)} flight levels in {elapsed_time:.1f} seconds ({len(tasks) / elapsed_time:.1f} levels/sec)")
 
     except Exception as e:
         print(f"Error processing file {wind_file}: {e}")
@@ -187,8 +226,25 @@ def process_grib_files(wind_file, temp_file, vector_zoom_levels, raster_zoom_lev
         traceback.print_exc()
 
 def process_single_level(wind_ds, u_data, v_data, temp_data, lats, lons, flight_level,
-                        vector_zoom_levels, raster_zoom_levels, output_dir, num_workers):
-    """Process a single pressure level and generate tiles."""
+                        vector_zoom_levels, raster_zoom_levels, output_dir, num_workers, tile_type='all'):
+    """Process a single pressure level and generate tiles.
+
+    Args:
+        wind_ds: Wind dataset
+        u_data: U component data
+        v_data: V component data
+        temp_data: Temperature data (optional)
+        lats: Latitude values
+        lons: Longitude values
+        flight_level: Flight level string (e.g., '250hPa')
+        vector_zoom_levels: List of zoom levels for vector tiles
+        raster_zoom_levels: List of zoom levels for raster tiles
+        output_dir: Directory to save output tiles
+        num_workers: Number of worker processes/threads
+        tile_type: Type of tiles to generate ('wind', 'temp', 'streamline', or 'all')
+    """
+    start_time = time.time()
+
     # Check if longitudes are in 0-360 range and convert to -180 to 180 if needed
     if np.min(lons) >= 0 and np.max(lons) > 180:
         print("Converting longitudes from 0-360 range to -180 to 180 if needed")
@@ -222,13 +278,22 @@ def process_single_level(wind_ds, u_data, v_data, temp_data, lats, lons, flight_
                 temp_data_values = temp_data.values
                 temp_data_reordered = np.concatenate([temp_data_values[:, split_idx:], temp_data_values[:, :split_idx]], axis=1)
                 temp_data = xr.DataArray(temp_data_reordered, dims=temp_data.dims,
-                                       coords={temp_data.dims[0]: lats, temp_data.dims[1]: lons})
+                                      coords={temp_data.dims[0]: lats, temp_data.dims[1]: lons})
         else:
             # Just use the normalized longitudes without reordering
             lons = lons_normalized
 
+    # Create required directories based on tile type
+    if tile_type in ['wind', 'all']:
+        ensure_dir_exists(os.path.join(output_dir, "wind", flight_level))
+    if tile_type in ['temp', 'all'] and temp_data is not None:
+        ensure_dir_exists(os.path.join(output_dir, "temp", flight_level))
+    if tile_type in ['streamline', 'all']:
+        ensure_dir_exists(os.path.join(output_dir, "streamline", flight_level))
+
     # ---- Generate Vector Tiles ----
-    if vector_zoom_levels:
+    vector_start = time.time()
+    if vector_zoom_levels and tile_type in ['wind', 'temp', 'all']:
         print(f"Generating vector tiles for zoom levels {vector_zoom_levels}...")
         # Create GeoJSON features
         features = create_geojson_features(lats, lons, u_data.values, v_data.values,
@@ -240,11 +305,21 @@ def process_single_level(wind_ds, u_data, v_data, temp_data, lats, lons, flight_
         # Save GeoJSON tiles
         save_geojson_tiles(tiles_features, flight_level, output_dir)
 
-        print(f"Generated vector tiles for flight level {flight_level} at zoom levels {vector_zoom_levels}")
+        vector_time = time.time() - vector_start
+        print(f"Generated vector tiles for flight level {flight_level} at zoom levels {vector_zoom_levels} in {vector_time:.2f}s")
 
     # ---- Generate Raster Tiles ----
+    raster_start = time.time()
     if raster_zoom_levels and len(raster_zoom_levels) > 0:
+        # Use multiple processes for tile generation
         generate_raster_tiles(lats, lons, u_data, v_data, temp_data,
-                            raster_zoom_levels, flight_level, output_dir, num_workers)
+                            raster_zoom_levels, flight_level, output_dir, num_workers, tile_type)
 
-        print(f"Generated raster tiles for flight level {flight_level} at zoom levels {raster_zoom_levels}")
+        raster_time = time.time() - raster_start
+        print(f"Generated raster tiles for flight level {flight_level} at zoom levels {raster_zoom_levels} in {raster_time:.2f}s")
+
+    # Clean up to free memory
+    del u_data, v_data, temp_data
+
+    total_time = time.time() - start_time
+    print(f"Total time for flight level {flight_level}: {total_time:.2f}s")

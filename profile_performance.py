@@ -1,94 +1,123 @@
 #!/usr/bin/env python3
 """
-Profile the performance of the weather tile server application.
-This script will run the tile generation process with profiling enabled
-to identify bottlenecks in the code.
+Wind & Temperature Tile Server - Performance Testing
+Tool to benchmark and compare performance of different parallelization strategies.
 """
 
-import cProfile
-import pstats
-import io
 import os
 import time
-import sys
-from pstats import SortKey
-import shutil
+import subprocess
+import argparse
+from datetime import datetime
 
-# Import the main processing functions
-from grib_processing import process_grib_files
-from utils import find_matching_files, ensure_dir_exists
-from config import VECTOR_ZOOM_LEVELS, RASTER_ZOOM_LEVELS, DATA_DIR, OUTPUT_DIR, NUM_WORKERS
+def run_test(name, command, repeat=1, save_output=True):
+    """Run a test and measure its performance."""
+    print(f"\n===== Running test: {name} =====")
+    print(f"Command: {command}")
 
-def profile_tile_generation():
-    """Run the tile generation process with profiling enabled."""
-    # Ensure output directory exists
-    ensure_dir_exists(OUTPUT_DIR)
+    total_time = 0
+    outputs = []
 
-    # Find matching wind and temperature files
-    file_pairs = find_matching_files(DATA_DIR, "wind-*.GRIB", "temp-*.GRIB")
+    for i in range(repeat):
+        print(f"\nRun {i+1}/{repeat}")
+        start_time = time.time()
 
-    if not file_pairs:
-        print(f"No matching GRIB files found in {DATA_DIR}")
-        return
+        # Run the command and capture output
+        result = subprocess.run(command, shell=True, text=True, capture_output=True)
 
-    # Take only the first pair for profiling to keep it manageable
-    wind_file, temp_file = file_pairs[0]
+        elapsed = time.time() - start_time
+        total_time += elapsed
+        outputs.append((result.stdout, result.stderr))
 
-    print(f"Profiling with wind file: {wind_file}")
-    print(f"Profiling with temperature file: {temp_file}")
+        # Print the output from this run
+        print(result.stdout)
+        if result.stderr:
+            print(f"Errors:\n{result.stderr}")
+        print(f"Run {i+1} time: {elapsed:.2f} seconds")
 
-    # Create a restricted zoom level set for faster profiling
-    vector_zoom = VECTOR_ZOOM_LEVELS[:1]  # Just the first zoom level
-    raster_zoom = [3]  # Profile only zoom level 3
+    avg_time = total_time / repeat
+    print(f"\nTest '{name}' completed {repeat} runs")
+    print(f"Average time: {avg_time:.2f} seconds")
 
-    print(f"Using zoom levels: Vector {vector_zoom}, Raster {raster_zoom}")
+    if save_output:
+        # Save detailed results to file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"profile_results_{name.replace(' ', '_').lower()}_{timestamp}.txt"
+        with open(filename, "w") as f:
+            f.write(f"Test: {name}\n")
+            f.write(f"Command: {command}\n")
+            f.write(f"Average time over {repeat} runs: {avg_time:.2f} seconds\n\n")
 
-    # Delete existing tiles for 250hPa level to force reprocessing
-    test_level = "250hPa"
-    wind_path = os.path.join(OUTPUT_DIR, "wind", test_level)
-    temp_path = os.path.join(OUTPUT_DIR, "temp", test_level)
+            for i, (stdout, stderr) in enumerate(outputs):
+                f.write(f"== Run {i+1} ==\n")
+                f.write(stdout)
+                if stderr:
+                    f.write("\nErrors:\n")
+                    f.write(stderr)
+                f.write("\n\n")
 
-    if os.path.exists(wind_path):
-        print(f"Removing existing wind tiles for {test_level} to force processing")
-        shutil.rmtree(wind_path)
+        print(f"Results saved to {filename}")
 
-    if os.path.exists(temp_path):
-        print(f"Removing existing temperature tiles for {test_level} to force processing")
-        shutil.rmtree(temp_path)
+    return avg_time
 
-    # Start profiling
-    profiler = cProfile.Profile()
-    profiler.enable()
+def main():
+    parser = argparse.ArgumentParser(description="Test performance of different tile generation strategies")
+    parser.add_argument("--zoom", type=str, default="0,1,2,3",
+                        help="Zoom levels to use for testing (default: 0,1,2,3)")
+    parser.add_argument("--threads", type=str, default="1,2,4,8",
+                        help="Thread counts to test (comma-separated, default: 1,2,4,8)")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Number of times to repeat each test (default: 1)")
+    parser.add_argument("--output", type=str, default="profile_results.txt",
+                        help="Output file for summary results (default: profile_results.txt)")
+    args = parser.parse_args()
 
-    # Run the actual processing
-    process_grib_files(wind_file, temp_file, vector_zoom, raster_zoom, OUTPUT_DIR, NUM_WORKERS)
+    # Parse the thread counts
+    thread_counts = [int(t) for t in args.threads.split(",")]
 
-    # Stop profiling
-    profiler.disable()
+    # Tests to run
+    tests = [
+        # ThreadPoolExecutor tests (original)
+        *[{
+            "name": f"ThreadPoolExecutor ({threads} threads)",
+            "command": f"python grib_to_tiles.py --threads {threads} --zoom {args.zoom}"
+        } for threads in thread_counts],
 
-    # Output results sorted by cumulative time
-    s = io.StringIO()
-    ps = pstats.Stats(profiler, stream=s).sort_stats(SortKey.CUMULATIVE)
-    ps.print_stats(30)  # Print top 30 functions by cumulative time
-    print(s.getvalue())
+        # ProcessPoolExecutor tests (new)
+        *[{
+            "name": f"ProcessPoolExecutor ({threads} processes)",
+            "command": f"python grib_to_tiles.py --threads {threads} --processes {threads} --zoom {args.zoom} --use-processes"
+        } for threads in thread_counts],
+    ]
 
-    # Also output results sorted by total time
-    s = io.StringIO()
-    ps = pstats.Stats(profiler, stream=s).sort_stats(SortKey.TIME)
-    ps.print_stats(30)  # Print top 30 functions by total time
-    print("\n--- Sorted by total time ---")
-    print(s.getvalue())
+    # Run each test and collect results
+    results = []
+    for test in tests:
+        avg_time = run_test(test["name"], test["command"], repeat=args.repeat)
+        results.append((test["name"], avg_time))
 
-    # Save results to a file
-    with open('profile_results.txt', 'w') as f:
-        ps = pstats.Stats(profiler, stream=f)
-        ps.sort_stats(SortKey.CUMULATIVE)
-        ps.print_stats()
+    # Print and save summary
+    print("\n===== Performance Summary =====")
 
-    print(f"Full profile results saved to profile_results.txt")
+    # Find the baseline (slowest) time for comparison
+    baseline = max(results, key=lambda x: x[1])[1]
+
+    with open(args.output, "w") as f:
+        f.write(f"Wind & Temperature Tile Server - Performance Test Results\n")
+        f.write(f"Run date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Zoom levels: {args.zoom}\n")
+        f.write(f"Repetitions per test: {args.repeat}\n\n")
+
+        f.write("Test configuration | Time (seconds) | Improvement\n")
+        f.write("--------------------|----------------|------------\n")
+
+        # Sort by performance (fastest first)
+        for name, time in sorted(results, key=lambda x: x[1]):
+            improvement = baseline / time
+            print(f"{name}: {time:.2f}s ({improvement:.2f}x faster than baseline)")
+            f.write(f"{name} | {time:.2f} | {improvement:.2f}x\n")
+
+    print(f"\nDetailed summary saved to {args.output}")
 
 if __name__ == "__main__":
-    start_time = time.time()
-    profile_tile_generation()
-    elapsed = time.time() - start_time
-    print(f"Total profiling time: {elapsed:.2f} seconds")
+    main()
